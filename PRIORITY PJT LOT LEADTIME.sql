@@ -32,15 +32,15 @@ SELECT
   FROM (
         SELECT LIST.*
              , DATA.*
-	         , MIN(LIST.PRIORITY_WORK_CNTR_CD) OVER (PARTITION BY LIST.SALE_OPP_NO
-	                                                            , LIST.PJT_SHIP
-	                                                            , LIST.SHIP_SEQ
-	                                                            , LIST.SHIP_SEQ_LOT
-	                                                            , LIST.SUL_NO
-	                                                            , LIST.ASSEMBLY_SEQ
-	                                                            , LIST.ASSEMBLY
-	                                                            , LIST.PROCESS_SEQ
-	                                                            , LIST.PROCESS_CODE) AS MIN_PRIORITY_WORK_CNTR_CD
+                , MIN(LIST.PRIORITY_WORK_CNTR_CD) OVER (PARTITION BY LIST.SALE_OPP_NO
+                                                                , LIST.PJT_SHIP
+                                                                , LIST.SHIP_SEQ
+                                                                , LIST.SHIP_SEQ_LOT
+                                                                , LIST.SUL_NO
+                                                                , LIST.ASSEMBLY_SEQ
+                                                                , LIST.ASSEMBLY
+                                                                , LIST.PROCESS_SEQ
+                                                                , LIST.PROCESS_CODE) AS MIN_PRIORITY_WORK_CNTR_CD
             --    LIST.SALE_OPP_NO
             --  , LIST.PJT_SHIP
             --  , LIST.SHIP_SEQ

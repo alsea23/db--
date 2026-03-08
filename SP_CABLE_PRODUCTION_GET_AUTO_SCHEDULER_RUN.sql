@@ -4,7 +4,7 @@ CREATE   PROCEDURE [dbo].[SP_CABLE_PRODUCTION_GET_AUTO_SCHEDULER_RUN]
     , @P_SENS_AFTER       INT = 0      -- FIX 종료 후 buffer(일)
     , @P_ALLOW_OVERLAP    INT = 0      -- FIX와 겹침 허용 일수
     , @P_PREP_PROC_DAYS   INT = 1      -- 공정 종료 후 다음 공정 준비일
-    , @P_PREP_FJ_DAYS     INT = 0      -- 설비 작업 종료 후 같은 설비 준비일
+    , @P_PREP_FJ_DAYS     INT = 1      -- 설비 작업 종료 후 같은 설비 준비일
 )
 AS
 BEGIN
@@ -64,6 +64,31 @@ BEGIN
         , @CBLOCK_S       INT
         , @CBLOCK_E       INT;
         
+    /* =================================================================================
+       루프 내에서 반복적으로 생성/삭제되는 임시 테이블을 외부에서 한 번만 생성
+    ================================================================================= */
+    IF OBJECT_ID('tempdb..#PROC_LIST') IS NOT NULL DROP TABLE #PROC_LIST;
+    CREATE TABLE #PROC_LIST
+    (
+        RN            INT IDENTITY(1,1) NOT NULL,
+        PROCESS_SEQ   INT               NULL,
+        PROCESS_CODE  VARCHAR(20)       NULL
+    );
+
+    IF OBJECT_ID('tempdb..#FJ_LIST') IS NOT NULL DROP TABLE #FJ_LIST;
+    CREATE TABLE #FJ_LIST
+    (
+        RN              INT IDENTITY(1,1) NOT NULL,
+        FJ_ASSEMBLY_SEQ INT               NOT NULL
+    );
+
+    IF OBJECT_ID('tempdb..#SUB_EQUIP_LIST') IS NOT NULL DROP TABLE #SUB_EQUIP_LIST;
+    CREATE TABLE #SUB_EQUIP_LIST
+    (
+        RN            INT IDENTITY(1,1) NOT NULL,
+        WORK_CNTR_SEQ INT NULL,
+        WORK_CNTR_CD  NVARCHAR(20) NOT NULL
+    );
         
     /* =====================================================================================
        [CUR_LOT]
@@ -71,25 +96,13 @@ BEGIN
          LOT 단위 루프를 돈다.
        - ORDER BY로 처리 순서를 고정 (SHIP_SEQ DESC 포함)
     ===================================================================================== */
-	DECLARE CUR_LOT CURSOR LOCAL FAST_FORWARD FOR
-	SELECT 
-	       SALE_OPP_NO, 
-	       PJT_SHIP, 
-	       SHIP_SEQ, 
-	       SHIP_SEQ_LOT, 
-	       LOT_NO, 
-	       ATWRT02, 
-	       ASSEMBLY_SEQ
-	FROM #LOT_ORDER
-	GROUP BY 
-	       SALE_OPP_NO, 
-	       PJT_SHIP, 
-	       SHIP_SEQ, 
-	       SHIP_SEQ_LOT, 
-	       LOT_NO, 
-	       ATWRT02, 
-	       ASSEMBLY_SEQ
-	ORDER BY MIN(ASSIGN_SEQ) ASC; -- 그룹 내 가장 작은 ASSIGN_SEQ 기준으로 정렬!
+    DECLARE CUR_LOT CURSOR LOCAL FAST_FORWARD FOR
+    SELECT
+           SALE_OPP_NO, PJT_SHIP, SHIP_SEQ, SHIP_SEQ_LOT, LOT_NO, ATWRT02, ASSEMBLY_SEQ
+    FROM #LOT_ORDER
+    GROUP BY
+           SALE_OPP_NO, PJT_SHIP, SHIP_SEQ, SHIP_SEQ_LOT, LOT_NO, ATWRT02, ASSEMBLY_SEQ
+    ORDER BY MIN(ASSIGN_SEQ) ASC; -- 그룹 내 가장 작은 ASSIGN_SEQ 기준으로 정렬!
 
     OPEN CUR_LOT;
 
@@ -102,13 +115,7 @@ BEGIN
            1) 공정 리스트 만들기 (#PROC_LIST)
            - 해당 LOT/ASSEMBLY에서 수행해야 하는 공정들을 PROCESS_SEQ 기준으로 정렬해 RN 부여
         ================================================================================= */
-        IF OBJECT_ID('tempdb..#PROC_LIST') IS NOT NULL DROP TABLE #PROC_LIST;
-        CREATE TABLE #PROC_LIST
-        (
-            RN            INT IDENTITY(1,1) NOT NULL,
-            PROCESS_SEQ   INT               NULL,
-            PROCESS_CODE  VARCHAR(20)       NULL
-        );
+        TRUNCATE TABLE #PROC_LIST;
 
         INSERT INTO #PROC_LIST(PROCESS_SEQ, PROCESS_CODE)        
         SELECT DISTINCT
@@ -116,58 +123,38 @@ BEGIN
              , L.PROCESS_CODE
           FROM #LOT_ORDER L
          WHERE L.SALE_OPP_NO  = @SALE_OPP_NO
---           AND L.PJT_SHIP     = @PJT_SHIP
---           AND L.SHIP_SEQ     = @SHIP_SEQ
---           AND L.SHIP_SEQ_LOT = @SHIP_SEQ_LOT
            AND L.LOT_NO       = @LOT_NO
            AND L.ASSEMBLY_SEQ = @ASSEMBLY_SEQ
-         ORDER BY L.PROCESS_SEQ
+         ORDER BY L.PROCESS_SEQ;
 
         /* =================================================================================
            2) LOT별 공정-설비 리스트 만들기 (#LOT_WORK_CNTR_LIST)
            - 해당 LOT/ASSEMBLY에서 수행해야 하는 공정-설비 리스트
         ================================================================================= */
-        IF OBJECT_ID('tempdb..#LOT_WORK_CNTR_LIST') IS NOT NULL DROP TABLE #LOT_WORK_CNTR_LIST;
-        CREATE TABLE #LOT_WORK_CNTR_LIST
-        (
-            LOT_NO        VARCHAR(50) NULL,
-            PROCESS_CODE  VARCHAR(20) NULL,
-            WORK_CNTR_CD  VARCHAR(20) NULL
-        );
+        TRUNCATE TABLE #LOT_WORK_CNTR_LIST;
 
         INSERT INTO #LOT_WORK_CNTR_LIST(LOT_NO, PROCESS_CODE, WORK_CNTR_CD)      
         SELECT DISTINCT
                S.LOT_NO
              , S.PROCESS_CODE
              , S.WORK_CNTR_CD
-          FROM #SRC_FJ Sa
+          FROM #SRC_FJ S
          WHERE S.SALE_OPP_NO  = @SALE_OPP_NO
---           AND S.PJT_SHIP     = @PJT_SHIP
---           AND S.SHIP_SEQ     = @SHIP_SEQ
---           AND S.SHIP_SEQ_LOT = @SHIP_SEQ_LOT
            AND S.LOT_NO       = @LOT_NO
-           AND S.ASSEMBLY_SEQ = @ASSEMBLY_SEQ
+           AND S.ASSEMBLY_SEQ = @ASSEMBLY_SEQ;
          
          
         /* =================================================================================
-           3) FJ 리스트 만들기 (#FJ_LIST)
+           2) FJ 리스트 만들기 (#FJ_LIST)
            - 해당 LOT/ASSEMBLY에서 흘려야 하는 FJ_ASSEMBLY_SEQ 목록
            - 이후 공정별로 이 FJ들을 순서대로 처리
         ================================================================================= */
-        IF OBJECT_ID('tempdb..#FJ_LIST') IS NOT NULL DROP TABLE #FJ_LIST;
-        CREATE TABLE #FJ_LIST
-        (
-            RN              INT IDENTITY(1,1) NOT NULL,
-            FJ_ASSEMBLY_SEQ INT               NOT NULL
-        );
+        TRUNCATE TABLE #FJ_LIST;
 
         INSERT INTO #FJ_LIST(FJ_ASSEMBLY_SEQ)
         SELECT DISTINCT S.FJ_ASSEMBLY_SEQ
         FROM #SRC_FJ S
         WHERE S.SALE_OPP_NO  = @SALE_OPP_NO
---          AND S.PJT_SHIP     = @PJT_SHIP
---          AND S.SHIP_SEQ     = @SHIP_SEQ
---          AND S.SHIP_SEQ_LOT = @SHIP_SEQ_LOT
           AND S.LOT_NO       = @LOT_NO
           AND S.ASSEMBLY_SEQ = @ASSEMBLY_SEQ
         ORDER BY S.FJ_ASSEMBLY_SEQ;
@@ -191,83 +178,84 @@ BEGIN
             WHERE RN = @P_RN;
 
 
+            
             /* =============================================================================
                (A) 공정별 설비 선택
                - 기본은 #WORK_CNTR_TIMESTAMP에서 TS가 가장 작은 설비를 선택
+               - [필터 적용] #LOT_WORK_CNTR_LIST에 존재하는 설비 중에서만 선택
+                 (자동배정 대상 설비 제어)
                - LDS/UST는 그룹 설비 선택 로직
                - INS는 ATWRT02(코어) 값으로 후보 설비를 제한
             ============================================================================= */
+            -- 변수를 미리 초기화하여 불필요한 NULL 체크 제거
+            SET @CHOSEN_EQUIP     = '';
+            SET @CUR_TS           = 0;
+            SET @CHOSEN_GRP_EQUIP = '';
+            SET @CUR_GRP_TS       = 0;
+
             IF @PROCESS_CODE IN ('LDS','UST')
             BEGIN
                 SELECT TOP (1)
-                      @CHOSEN_GRP_EQUIP = W.WORK_CNTR_CD
-                    , @CUR_GRP_TS       = W.TIMESTAMP_POINT
+                    @CHOSEN_EQUIP = W.WORK_CNTR_CD
+                    , @CUR_TS       = W.TIMESTAMP_POINT
                 FROM #WORK_CNTR_TIMESTAMP W
                 WHERE W.PROCESS_CODE = @PROCESS_CODE
-                  AND EXISTS
-                  (
-                      SELECT 1
-                      FROM #WC_GRP G
-                      WHERE G.SIMUL_PROCESS_CD = @PROCESS_CODE
+                AND EXISTS (
+                    SELECT 1 FROM #WC_GRP G
+                    WHERE G.SIMUL_PROCESS_CD = @PROCESS_CODE
                         AND G.GRP_WORK_CNTR_CD = W.WORK_CNTR_CD
                         AND G.WORK_CNTR_CD     = W.WORK_CNTR_CD
-                  )
+                )
+                -- [전술 1] Leadtime 데이터가 계산된(필터링된) 설비만 통과!
+                AND EXISTS (
+                    SELECT 1 FROM #TEMP_LOT_LEADTIME LT   -- ※ 실제 Leadtime 임시테이블명으로 변경
+                    WHERE LT.LOT_ID       = @LOT_ID       -- ※ 실제 LOT 식별 변수명으로 변경
+                        AND LT.PROCESS_CODE = W.PROCESS_CODE
+                        AND LT.WORK_CNTR_CD = W.WORK_CNTR_CD
+                )
                 ORDER BY W.TIMESTAMP_POINT ASC, W.SEQ ASC;
 
-                IF @CHOSEN_GRP_EQUIP IS NULL
-                BEGIN
-                    SET @CHOSEN_GRP_EQUIP = '';
-                    SET @CUR_GRP_TS = 0;
-                END
-
-                SET @CHOSEN_EQUIP = @CHOSEN_GRP_EQUIP;
-                SET @CUR_TS = @CUR_GRP_TS;
+                -- 기존 로직 호환을 위해 GRP 변수에도 동일하게 세팅
+                SET @CHOSEN_GRP_EQUIP = @CHOSEN_EQUIP;
+                SET @CUR_GRP_TS       = @CUR_TS;
+            END
+            ELSE IF @PROCESS_CODE = 'INS'
+            BEGIN
+                /* ✅ INS 공정: ATWRT02(코어) 값으로 설비 후보군 제한 + Leadtime 필터 적용 */
+                SELECT TOP (1)
+                    @CHOSEN_EQUIP = W.WORK_CNTR_CD
+                    , @CUR_TS       = W.TIMESTAMP_POINT
+                FROM #WORK_CNTR_TIMESTAMP W
+                WHERE W.PROCESS_CODE = @PROCESS_CODE
+                AND (
+                    (ISNULL(@ATWRT02, '') = '3'  AND W.WORK_CNTR_CD IN ('INS044', 'INS048', 'INS049'))
+                    OR (ISNULL(@ATWRT02, '') = '1'  AND W.WORK_CNTR_CD IN ('INS050', 'INS051', 'INS052'))
+                )
+                -- [전술 1] Leadtime 데이터가 계산된(필터링된) 설비만 통과!
+                AND EXISTS (
+                    SELECT 1 FROM #TEMP_LOT_LEADTIME LT   -- ※ 실제 Leadtime 임시테이블명으로 변경
+                    WHERE LT.LOT_ID       = @LOT_ID       -- ※ 실제 LOT 식별 변수명으로 변경
+                        AND LT.PROCESS_CODE = W.PROCESS_CODE
+                        AND LT.WORK_CNTR_CD = W.WORK_CNTR_CD
+                )
+                ORDER BY W.TIMESTAMP_POINT ASC, W.SEQ ASC;
             END
             ELSE
             BEGIN
-                /* ✅ INS 공정: ATWRT02(코어) 값으로 설비 후보군 제한 */
-			   IF @PROCESS_CODE = 'INS'
-			   BEGIN
-			       SELECT TOP (1)
-			             @CHOSEN_EQUIP = W.WORK_CNTR_CD
-			           , @CUR_TS       = W.TIMESTAMP_POINT
-			       FROM #WORK_CNTR_TIMESTAMP W
-			       WHERE W.PROCESS_CODE = @PROCESS_CODE
-			         AND (
-			              (ISNULL(@ATWRT02, '') = '3'  AND W.WORK_CNTR_CD IN ('INS044', 'INS048', 'INS049'))
-			           OR (ISNULL(@ATWRT02, '') = '1'  AND W.WORK_CNTR_CD IN ('INS050', 'INS051', 'INS052'))
-			         )
-			       ORDER BY W.TIMESTAMP_POINT ASC, W.SEQ ASC;
-			
-			       IF @CHOSEN_EQUIP IS NULL
-			       BEGIN
-			           -- 후보군에 해당 설비가 없거나 TS 테이블에 없으면, 디폴트 처리(원래 로직으로 fallback할지 선택)
-			           SET @CHOSEN_EQUIP = '';
-			           SET @CUR_TS = 0;
-			       END
-			
-			       SET @CHOSEN_GRP_EQUIP = NULL;
-			       SET @CUR_GRP_TS = NULL;
-			   END
-			   ELSE
-			   BEGIN
-			       -- 기존 일반 공정 선택 로직 그대로
-			       SELECT TOP (1)
-			             @CHOSEN_EQUIP = W.WORK_CNTR_CD
-			           , @CUR_TS       = W.TIMESTAMP_POINT
-			       FROM #WORK_CNTR_TIMESTAMP W
-			       WHERE W.PROCESS_CODE = @PROCESS_CODE
-			       ORDER BY W.TIMESTAMP_POINT ASC, W.SEQ ASC;
-			
-			       IF @CHOSEN_EQUIP IS NULL
-			       BEGIN
-			           SET @CHOSEN_EQUIP = '';
-			           SET @CUR_TS = 0;
-			       END
-			
-			       SET @CHOSEN_GRP_EQUIP = NULL;
-			       SET @CUR_GRP_TS = NULL;
-			   END
+                /* ✅ 일반 공정: Leadtime 필터 적용 */
+                SELECT TOP (1)
+                    @CHOSEN_EQUIP = W.WORK_CNTR_CD
+                    , @CUR_TS       = W.TIMESTAMP_POINT
+                FROM #WORK_CNTR_TIMESTAMP W
+                WHERE W.PROCESS_CODE = @PROCESS_CODE
+                -- [전술 1] Leadtime 데이터가 계산된(필터링된) 설비만 통과!
+                AND EXISTS (
+                    SELECT 1 FROM #TEMP_LOT_LEADTIME LT   -- ※ 실제 Leadtime 임시테이블명으로 변경
+                    WHERE LT.LOT_ID       = @LOT_ID       -- ※ 실제 LOT 식별 변수명으로 변경
+                        AND LT.PROCESS_CODE = W.PROCESS_CODE
+                        AND LT.WORK_CNTR_CD = W.WORK_CNTR_CD
+                )
+                ORDER BY W.TIMESTAMP_POINT ASC, W.SEQ ASC;
             END
 
             /* =============================================================================
@@ -322,23 +310,13 @@ BEGIN
 				          - 기본 정렬: WORK_CNTR_SEQ
 				          - (옵션) UST 단계 순서를 prefix로 고정하고 싶으면 CASE ORDER BY 사용 가능
 				    ------------------------------------------------------------ */
-				    IF OBJECT_ID('tempdb..#SUB_EQUIP_LIST') IS NOT NULL DROP TABLE #SUB_EQUIP_LIST;
-				    CREATE TABLE #SUB_EQUIP_LIST
-				    (
-				        RN            INT IDENTITY(1,1) NOT NULL,
-				        WORK_CNTR_SEQ INT NULL,
-				        WORK_CNTR_CD  NVARCHAR(20) NOT NULL
-				    );
-				
+				    TRUNCATE TABLE #SUB_EQUIP_LIST;
 				    INSERT INTO #SUB_EQUIP_LIST(WORK_CNTR_SEQ, WORK_CNTR_CD)
 				    SELECT
 				          S.WORK_CNTR_SEQ
 				        , S.WORK_CNTR_CD
 				    FROM #SRC_FJ S
 				    WHERE S.SALE_OPP_NO = @SALE_OPP_NO
---				      AND S.PJT_SHIP     = @PJT_SHIP
---				      AND S.SHIP_SEQ     = @SHIP_SEQ
---				      AND S.SHIP_SEQ_LOT = @SHIP_SEQ_LOT
 				      AND S.LOT_NO       = @LOT_NO
 				      AND S.ASSEMBLY_SEQ = @ASSEMBLY_SEQ
 				      AND S.FJ_ASSEMBLY_SEQ = @FJ_ASM_SEQ
@@ -369,9 +347,6 @@ BEGIN
 				    SELECT @READY_TS = READY_TS
 				    FROM #FJ_READY_TS
 				    WHERE SALE_OPP_NO = @SALE_OPP_NO
---				      AND PJT_SHIP     = @PJT_SHIP
---				      AND SHIP_SEQ     = @SHIP_SEQ
---				      AND SHIP_SEQ_LOT = @SHIP_SEQ_LOT
 				      AND LOT_NO       = @LOT_NO
 				      AND ASSEMBLY_SEQ = @ASSEMBLY_SEQ
 				      AND FJ_ASSEMBLY_SEQ = @FJ_ASM_SEQ;
@@ -415,9 +390,6 @@ BEGIN
 				            , @WORK_CNTR_SEQ = S.WORK_CNTR_SEQ
 				        FROM #SRC_FJ S
 				        WHERE S.SALE_OPP_NO = @SALE_OPP_NO
---				          AND S.PJT_SHIP     = @PJT_SHIP
---				          AND S.SHIP_SEQ     = @SHIP_SEQ
---				          AND S.SHIP_SEQ_LOT = @SHIP_SEQ_LOT
 				          AND S.LOT_NO       = @LOT_NO
 				          AND S.ASSEMBLY_SEQ = @ASSEMBLY_SEQ
 				          AND S.FJ_ASSEMBLY_SEQ = @FJ_ASM_SEQ
@@ -550,9 +522,6 @@ BEGIN
 				        UPDATE #FJ_READY_TS
 				        SET READY_TS = @LAST_END_TS + @P_PREP_PROC_DAYS
 				        WHERE SALE_OPP_NO = @SALE_OPP_NO
---				          AND PJT_SHIP     = @PJT_SHIP
---				          AND SHIP_SEQ     = @SHIP_SEQ
---				          AND SHIP_SEQ_LOT = @SHIP_SEQ_LOT
 				          AND LOT_NO       = @LOT_NO
 				          AND ASSEMBLY_SEQ = @ASSEMBLY_SEQ
 				          AND FJ_ASSEMBLY_SEQ = @FJ_ASM_SEQ;
@@ -584,9 +553,6 @@ BEGIN
                     , @WORK_CNTR_SEQ = S.WORK_CNTR_SEQ
                 FROM #SRC_FJ S
                 WHERE S.SALE_OPP_NO = @SALE_OPP_NO
---                  AND S.PJT_SHIP     = @PJT_SHIP
---                  AND S.SHIP_SEQ     = @SHIP_SEQ
---                  AND S.SHIP_SEQ_LOT = @SHIP_SEQ_LOT
                   AND S.LOT_NO       = @LOT_NO
                   AND S.ASSEMBLY_SEQ = @ASSEMBLY_SEQ
                   AND S.FJ_ASSEMBLY_SEQ = @FJ_ASM_SEQ
@@ -604,9 +570,6 @@ BEGIN
                 SELECT @READY_TS = READY_TS
                 FROM #FJ_READY_TS
                 WHERE SALE_OPP_NO = @SALE_OPP_NO
---                  AND PJT_SHIP     = @PJT_SHIP
---                  AND SHIP_SEQ     = @SHIP_SEQ
---                  AND SHIP_SEQ_LOT = @SHIP_SEQ_LOT
                   AND LOT_NO       = @LOT_NO
                   AND ASSEMBLY_SEQ = @ASSEMBLY_SEQ
                   AND FJ_ASSEMBLY_SEQ = @FJ_ASM_SEQ;
@@ -691,9 +654,6 @@ BEGIN
                 UPDATE #FJ_READY_TS
                 SET READY_TS = @END_TS + @P_PREP_PROC_DAYS
                 WHERE SALE_OPP_NO = @SALE_OPP_NO
---                  AND PJT_SHIP     = @PJT_SHIP
---                  AND SHIP_SEQ     = @SHIP_SEQ
---                  AND SHIP_SEQ_LOT = @SHIP_SEQ_LOT
                   AND LOT_NO       = @LOT_NO
                   AND ASSEMBLY_SEQ = @ASSEMBLY_SEQ
                   AND FJ_ASSEMBLY_SEQ = @FJ_ASM_SEQ;
@@ -710,4 +670,9 @@ BEGIN
 
     CLOSE CUR_LOT;
     DEALLOCATE CUR_LOT;
+
+    IF OBJECT_ID('tempdb..#PROC_LIST') IS NOT NULL DROP TABLE #PROC_LIST;
+    IF OBJECT_ID('tempdb..#LOT_WORK_CNTR_LIST') IS NOT NULL DROP TABLE #LOT_WORK_CNTR_LIST;
+    IF OBJECT_ID('tempdb..#FJ_LIST') IS NOT NULL DROP TABLE #FJ_LIST;
+    IF OBJECT_ID('tempdb..#SUB_EQUIP_LIST') IS NOT NULL DROP TABLE #SUB_EQUIP_LIST;
 END
