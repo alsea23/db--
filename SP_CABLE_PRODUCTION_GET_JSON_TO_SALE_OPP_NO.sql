@@ -1,0 +1,22 @@
+CREATE PROCEDURE [dbo].[SP_CABLE_PRODUCTION_GET_JSON_TO_SALE_OPP_NO]
+	@JSON_PARAMS NVARCHAR(MAX) -- JSON 데이터는 보통 NVARCHAR(MAX)로 받습니다.
+AS
+BEGIN 
+    SET NOCOUNT ON; -- 불필요한 행 수 메시지 출력 방지
+    SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+    BEGIN TRY
+        --  JSON 데이터를 파싱하여 리스트로 조회
+        SELECT 
+            PARAM_SALE_OPP_NO AS SALE_OPP_NO
+        FROM OPENJSON(@JSON_PARAMS)
+        WITH (
+            PARAM_SALE_OPP_NO VARCHAR(20) '$.PARAM_SALE_OPP_NO'
+        );
+        
+    END TRY
+    BEGIN CATCH
+        -- 에러 처리
+        THROW 52001, 'SP_CABLE_PRODUCTION_GET_JSON_TO_SALE_OPP_NO Json Parse error', 1;
+    END CATCH
+END;
