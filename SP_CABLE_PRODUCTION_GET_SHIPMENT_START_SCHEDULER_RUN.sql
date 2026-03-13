@@ -1,0 +1,72 @@
+CREATE PROCEDURE [dbo].[SP_CABLE_PRODUCTION_GET_SHIPMENT_START_SCHEDULER_RUN]
+(
+      @P_SENS_BEFORE INT, @P_SENS_AFTER INT, @P_ALLOW_OVERLAP INT,
+      @P_PREP_PROC_DAYS INT, @P_PREP_FJ_DAYS INT
+)
+AS
+BEGIN
+    -- 1. 항차별/공정별 '이론적 리드타임' 계산 (Base로부터의 상대적 위치)
+    -- 윈도우 함수를 이용해 루프 없이 공정 간 연결 시간을 계산합니다.
+    IF OBJECT_ID('tempdb..#LOCAL_TIMELINE') IS NOT NULL DROP TABLE #LOCAL_TIMELINE;
+    SELECT 
+        SALE_OPP_NO, PJT_SHIP, LOT_NO, PROCESS_CODE, WORK_CNTR_CODE, LEAD_TIME_DAYS, PRIORITY,
+        -- 이전 공정들의 리드타임 합계 + 공정간 준비일수(@P_PREP_PROC_DAYS)
+        ISNULL(SUM(LEAD_TIME_DAYS + @P_PREP_PROC_DAYS) OVER (
+            PARTITION BY LOT_NO ORDER BY PROCESS_SEQ 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ), 0) AS RELATIVE_STRT
+    INTO #LOCAL_TIMELINE
+    FROM #SRC_FJ;
+
+    -- 2. 항차 우선순위 루프 (Merge 단계)
+    DECLARE @CUR_PJT VARCHAR(20), @CUR_SHIP INT;
+    DECLARE SHIP_CURSOR CURSOR FOR 
+    SELECT SALE_OPP_NO, PJT_SHIP FROM #SHIPMENT_QUEUE ORDER BY PRIORITY ASC;
+
+    OPEN SHIP_CURSOR;
+    FETCH NEXT FROM SHIP_CURSOR INTO @CUR_PJT, @CUR_SHIP;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- [핵심 로직] 현재 항차가 설비 타임라인(Global)에서 시작할 수 있는 가장 빠른 지점 찾기
+        -- 이미 선순위 PJT가 점유(#WORK_CNTR_TIMESTAMP)한 시간을 피해서 SHIFT 합니다.
+        
+        DECLARE @GLOBAL_SHIFT INT = 0;
+
+        -- 해당 항차의 모든 공정이 설비 중복 없이 배치될 수 있는 최소 Shift값 계산
+        -- (간략화된 알고리즘: 설비가 비어있는 최대 인덱스를 찾아 그만큼 전체를 뒤로 미룸)
+        SELECT @GLOBAL_SHIFT = ISNULL(MAX(T.TS_IDX), 0) + 1
+        FROM #WORK_CNTR_TIMESTAMP T
+        JOIN #LOCAL_TIMELINE L ON T.WORK_CNTR_CODE = L.WORK_CNTR_CODE
+        WHERE L.SALE_OPP_NO = @CUR_PJT AND L.PJT_SHIP = @CUR_SHIP
+          AND T.IS_ASSIGNED = 1;
+
+        -- 최종 결과 테이블에 기록 (계산된 @GLOBAL_SHIFT 반영)
+        INSERT INTO #FINAL_ASSIGN_DATA (
+            SALE_OPP_NO, PJT_SHIP, LOT_NO, PROCESS_CODE, WORK_CNTR_CODE, 
+            STRT_TS, END_TS, IS_MANUAL
+        )
+        SELECT 
+            SALE_OPP_NO, PJT_SHIP, LOT_NO, PROCESS_CODE, WORK_CNTR_CODE,
+            RELATIVE_STRT + @GLOBAL_SHIFT, 
+            RELATIVE_STRT + @GLOBAL_SHIFT + LEAD_TIME_DAYS,
+            0
+        FROM #LOCAL_TIMELINE
+        WHERE SALE_OPP_NO = @CUR_PJT AND PJT_SHIP = @CUR_SHIP;
+
+        -- [중요] 점유된 시간만큼 설비 타임스탬프 업데이트 (다음 항차가 못 들어오게 방어)
+        UPDATE T
+        SET T.IS_ASSIGNED = 1,
+            T.SALE_OPP_NO = @CUR_PJT,
+            T.LOT_NO = F.LOT_NO
+        FROM #WORK_CNTR_TIMESTAMP T
+        JOIN #FINAL_ASSIGN_DATA F ON T.WORK_CNTR_CODE = F.WORK_CNTR_CODE
+        WHERE F.SALE_OPP_NO = @CUR_PJT AND F.PJT_SHIP = @CUR_SHIP
+          AND T.TS_IDX BETWEEN F.STRT_TS AND F.END_TS;
+
+        FETCH NEXT FROM SHIP_CURSOR INTO @CUR_PJT, @CUR_SHIP;
+    END
+
+    CLOSE SHIP_CURSOR;
+    DEALLOCATE SHIP_CURSOR;
+END
