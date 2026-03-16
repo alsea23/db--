@@ -155,6 +155,8 @@ BEGIN
     -- 4. 결과 반환
     -------------------------------------------------------------------------
     EXEC dbo.SP_CABLE_PRODUCTION_GET_AUTO_SCHEDULER_SELECT 
-        @TIMESTAMP_BASE_DATE, @P_TEMP_VERSION, @P_USER_CODE;
+        @TIMESTAMP_BASE_DATE, 
+        @P_TEMP_VERSION, 
+        @P_USER_CODE;
 
 END
